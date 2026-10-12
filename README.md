@@ -16,9 +16,9 @@ Quick terminal test: `python rag.py`
 
 ## Architecture
 1. `ingest.py` reads PDFs page by page (pypdf) and Excel rows (pandas), 10 rows per chunk.
-2. PDF text is split into ~800 character chunks with 150 overlap.
+2. PDF pages up to 2000 characters stay whole (tables are not cut); longer pages are split into ~800 character chunks with 150 overlap. "Semester V" / "Semester 05" are normalised to "Semester 5".
 3. Chunks are embedded locally with `all-MiniLM-L6-v2` and stored in ChromaDB (`chroma_db/`).
-4. `rag.py` embeds the question (plus the last 3 questions), retrieves the top-k chunks and sends them to an OpenRouter free model.
+4. `rag.py` uses hybrid search (vector + keyword match, e.g. "semester 5", "SE3102") to get the top-k chunks and sends them to an OpenRouter free model.
 5. `app.py` is a Streamlit chat that shows the answer and a "Sources" expander.
 
 Questions whose best match is farther than `MAX_DISTANCE` (default 0.75) get "I could not find this in the documents." without calling the LLM.

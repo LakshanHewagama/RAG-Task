@@ -13,5 +13,8 @@ FALLBACK_MODELS = [m.strip() for m in os.getenv("FALLBACK_MODELS", "").split(","
 MAX_DISTANCE = float(os.getenv("MAX_DISTANCE", "0.75"))
 
 DATA_DIR = "data"
+# Most files of each type the knowledge base accepts
+MAX_PDFS = 5
+MAX_EXCEL = 3
 CHROMA_DIR = "chroma_db"
 COLLECTION_NAME = "knowledge_base"

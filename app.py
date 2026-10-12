@@ -21,14 +21,15 @@ def load_collection():
     return rag.get_collection()
 
 
-def show_sources(sources):
+def show_sources(sources, question="", answer=""):
+    """Show only the chunks the answer cites, with the lines that match the question."""
     if not sources:
         return
     with st.expander("Sources"):
-        for i, s in enumerate(sources, start=1):
-            st.markdown(f"**[{i}] {rag.source_label(s['meta'])}**")
-            snippet = s["text"][:400] + ("..." if len(s["text"]) > 400 else "")
-            st.caption(snippet)
+        for i, s in rag.cited_sources(answer, sources):
+            text = rag.snippet(s["text"], question, answer)
+            st.markdown(f"**[{i}] {rag.exact_label(s['meta'], text)}**")
+            st.text(text)
 
 
 # Sidebar
@@ -50,7 +51,16 @@ with st.sidebar:
     files = [f for f in sorted(os.listdir(DATA_DIR)) if f.lower().endswith((".pdf", ".xlsx", ".xls"))] \
         if os.path.isdir(DATA_DIR) else []
     for f in files:
-        st.caption(f"📄 {f}")
+        name_col, del_col = st.columns([5, 1], vertical_alignment="center")
+        name_col.caption(f"📄 {f}")
+        if del_col.button("🗑️", key=f"delete_{f}", help=f"Delete {f}"):
+            os.remove(os.path.join(DATA_DIR, f))
+            with st.spinner("Re-ingesting..."):
+                ingest.main()
+            load_collection.clear()
+            rag._collection = None
+            st.session_state.upload_done = f"Deleted: {f}"
+            st.rerun()
     if not files:
         st.caption("No files in data/")
 
@@ -59,8 +69,15 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    uploads = st.file_uploader("Upload files", type=["pdf", "xlsx", "xls"], accept_multiple_files=True)
-    if uploads and st.button("Save & re-ingest"):
+    # Changing the uploader's key after a save gives an empty upload box
+    st.session_state.setdefault("upload_key", 0)
+    uploads = st.file_uploader("Upload files", type=["pdf", "xlsx", "xls"], accept_multiple_files=True,
+                               key=f"uploader_{st.session_state.upload_key}")
+    # Uploads replace same-named files, so count the combined set of names
+    upload_error = ingest.limit_error(set(files) | {f.name for f in uploads}) if uploads else None
+    if upload_error:
+        st.error(upload_error + " Remove some files first.")
+    if uploads and not upload_error and st.button("Save & re-ingest"):
         os.makedirs(DATA_DIR, exist_ok=True)
         for f in uploads:
             with open(os.path.join(DATA_DIR, f.name), "wb") as out:
@@ -69,8 +86,11 @@ with st.sidebar:
             ingest.main()
         load_collection.clear()
         rag._collection = None
-        st.success("Knowledge base updated.")
+        st.session_state.upload_key += 1
+        st.session_state.upload_done = f"Saved and ingested: {', '.join(f.name for f in uploads)}"
         st.rerun()
+    if "upload_done" in st.session_state:
+        st.success(st.session_state.pop("upload_done"))
 
 if not db_ready:
     st.warning("Knowledge base not found. Run `python ingest.py` first.")
@@ -81,10 +101,15 @@ rag._model = load_model()
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-for msg in st.session_state.messages:
+for idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-        show_sources(msg.get("sources"))
+        show_sources(msg.get("sources"), msg.get("question", ""), msg["content"])
+        # Deleting an answer also deletes its question, so it no longer affects later searches
+        if msg["role"] == "assistant" and st.button("🗑️ Delete", key=f"del_msg_{idx}"):
+            start = idx - 1 if idx > 0 and st.session_state.messages[idx - 1]["role"] == "user" else idx
+            del st.session_state.messages[start:idx + 1]
+            st.rerun()
 
 if question := st.chat_input("Ask a question about the documents"):
     history = [m["content"] for m in st.session_state.messages if m["role"] == "user"]
@@ -96,5 +121,7 @@ if question := st.chat_input("Ask a question about the documents"):
         with st.spinner("Thinking..."):
             answer, sources = rag.ask(question, history)
         st.markdown(answer)
-        show_sources(sources)
-    st.session_state.messages.append({"role": "assistant", "content": answer, "sources": sources})
+        show_sources(sources, question, answer)
+    st.session_state.messages.append(
+        {"role": "assistant", "content": answer, "sources": sources, "question": question})
+    st.rerun()  # redraw from history so the new answer gets its delete button

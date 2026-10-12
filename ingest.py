@@ -7,11 +7,13 @@ import pandas as pd
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
-from config import CHROMA_DIR, COLLECTION_NAME, DATA_DIR, EMBED_MODEL
+from config import CHROMA_DIR, COLLECTION_NAME, DATA_DIR, EMBED_MODEL, MAX_EXCEL, MAX_PDFS
 
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 ROWS_PER_CHUNK = 10
+# Pages up to this size stay as one chunk so tables are never cut in half
+MAX_PAGE_CHUNK = 2000
 
 
 def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
@@ -49,14 +51,29 @@ def clean_layout_text(text):
     return "\n".join(lines)
 
 
+ROMAN = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8}
+
+
+def normalize_numbers(text):
+    """'Semester V' / 'Semester 05' -> 'Semester 5' so they match questions like 'semester 5'."""
+    text = re.sub(r"\b(Semester|Year)\s+(VIII|VII|VI|IV|V|III|II|I)\b",
+                  lambda m: f"{m.group(1)} {ROMAN[m.group(2)]}", text)
+    return re.sub(r"\b(Semester|Year)\s+0(\d)\b", r"\1 \2", text)
+
+
 def read_pdf(path, name):
     docs = []
     reader = PdfReader(path)
     for page_num, page in enumerate(reader.pages, start=1):
-        text = clean_layout_text(page.extract_text(extraction_mode="layout") or "")
+        text = normalize_numbers(clean_layout_text(page.extract_text(extraction_mode="layout") or ""))
         if not text:
             continue
-        for i, chunk in enumerate(chunk_text(text)):
+        # The page title (first line) is repeated in every chunk so table rows keep their context
+        title = text.splitlines()[0][:150]
+        page_chunks = [text] if len(text) <= MAX_PAGE_CHUNK else chunk_text(text)
+        for i, chunk in enumerate(page_chunks):
+            if i > 0:
+                chunk = f"{title}\n{chunk}"
             docs.append({
                 "id": f"{name}-p{page_num}-c{i}",
                 "text": chunk,
@@ -67,19 +84,34 @@ def read_pdf(path, name):
 
 def read_excel(path, name):
     docs = []
-    sheets = pd.read_excel(path, sheet_name=None)
+    # header=None: read every row as data, then find the real header row ourselves
+    sheets = pd.read_excel(path, sheet_name=None, header=None)
     for sheet, df in sheets.items():
-        df = df.dropna(how="all")
+        df = df.dropna(how="all").dropna(axis=1, how="all")
+        if df.empty:
+            continue
+        cells = [[str(v).strip() if pd.notna(v) and str(v).strip() else None for v in r]
+                 for r in df.itertuples(index=False)]
+        excel_rows = [i + 1 for i in df.index]  # pandas index 0 = Excel row 1
+
+        # Header = first row where at least half the columns are filled with text (not numbers).
+        # Rows above it (e.g. a "Software Evolution" title) become the sheet title.
+        ncols = len(df.columns)
+        h = next((i for i, r in enumerate(cells)
+                  if sum(1 for v in r if v and not v.replace(".", "").isdigit()) >= max(2, ncols / 2)), 0)
+        headers = [v or f"Column {j + 1}" for j, v in enumerate(cells[h])]
+        title = " ".join(v for r in cells[:h] for v in r if v)
+
         rows = []
-        for idx, row in df.iterrows():
-            parts = [f"{col}: {val}" for col, val in row.items() if pd.notna(val) and str(val).strip()]
+        for r, excel_row in zip(cells[h + 1:], excel_rows[h + 1:]):
+            parts = [f"{col}: {val}" for col, val in zip(headers, r) if val]
             if parts:
-                # +2 = Excel row number (1-based and header row)
-                rows.append((idx + 2, ", ".join(parts)))
+                rows.append((excel_row, ", ".join(parts)))
+        heading = f"Sheet: {sheet}" + (f" ({title})" if title else "")
         for start in range(0, len(rows), ROWS_PER_CHUNK):
             group = rows[start:start + ROWS_PER_CHUNK]
             row_start, row_end = group[0][0], group[-1][0]
-            text = f"Sheet: {sheet}\n" + "\n".join(f"Row {r}: {t}" for r, t in group)
+            text = heading + "\n" + "\n".join(f"Row {r}: {t}" for r, t in group)
             docs.append({
                 "id": f"{name}-{sheet}-r{row_start}-{row_end}",
                 "text": text,
@@ -89,9 +121,28 @@ def read_excel(path, name):
     return docs
 
 
+def file_kind(name):
+    """'pdf', 'excel' or None for a file name."""
+    ext = os.path.splitext(name)[1].lower()
+    return "pdf" if ext == ".pdf" else "excel" if ext in (".xlsx", ".xls") else None
+
+
+def limit_error(names):
+    """Message if names has more PDFs or Excel files than allowed, else None."""
+    pdfs = sum(1 for n in names if file_kind(n) == "pdf")
+    excels = sum(1 for n in names if file_kind(n) == "excel")
+    if pdfs > MAX_PDFS or excels > MAX_EXCEL:
+        return (f"Only {MAX_PDFS} PDFs and {MAX_EXCEL} Excel files are allowed "
+                f"(found {pdfs} PDFs and {excels} Excel files).")
+    return None
+
+
 def load_documents():
     docs, counts = [], {}
-    for name in sorted(os.listdir(DATA_DIR)):
+    names = sorted(os.listdir(DATA_DIR))
+    if error := limit_error(names):
+        raise ValueError(error)
+    for name in names:
         path = os.path.join(DATA_DIR, name)
         ext = os.path.splitext(name)[1].lower()
         try:
@@ -114,9 +165,18 @@ def main():
         print(f"Folder '{DATA_DIR}/' not found. Create it and add your files.")
         return
 
-    docs, counts = load_documents()
+    try:
+        docs, counts = load_documents()
+    except ValueError as e:
+        print(e)
+        return
     if not docs:
         print(f"No PDF or Excel content found in '{DATA_DIR}/'.")
+        # Drop the old collection so deleted files are no longer answered from
+        try:
+            chromadb.PersistentClient(path=CHROMA_DIR).delete_collection(COLLECTION_NAME)
+        except Exception:
+            pass
         return
 
     print(f"Embedding {len(docs)} chunks with {EMBED_MODEL} ...")
